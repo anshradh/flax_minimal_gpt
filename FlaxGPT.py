@@ -9,12 +9,30 @@ from einops import rearrange
 MAIN = __name__ == "__main__"
 # %%
 @dataclass
-class GPTConfig:
+class FlaxGPTConfig:
+    """Dataclass for configuring a GPT-style transformer model.
+
+    Args:
+        d_model: Dimensionality of the residual stream
+        n_heads: Number of attention heads
+        n_layers: Number of transformer blocks
+        n_ctx: Max number of tokens in the context
+        d_vocab: Dimensionality of the input token embedding
+        d_vocab_out: Dimensionality of the output token embedding
+        layer_norm_eps: Epsilon for layer normalization
+        attn_only: If True, only use attention layers for each transformer block
+        mlp_dim: Dimensionality of the MLP layer in the transformer block. Defaults
+            to 4 * d_model
+        activation: Activation function to use in the transformer block. Defaults
+            to "gelu" - only relu and gelu are currently supported.
+
+    """
+
     d_model: int
     n_heads: int
     n_layers: int
-    d_vocab: int
     n_ctx: int
+    d_vocab: int
     d_vocab_out: Optional[int] = None
     layer_norm_eps: float = 1e-5
     attn_only: bool = False
@@ -22,6 +40,7 @@ class GPTConfig:
     activation: Optional[str] = None
 
     def __post_init__(self):
+        self.d_head = self.d_model // self.n_heads
         if not self.attn_only:
             if not self.mlp_dim:
                 self.mlp_dim = 4 * self.d_model
@@ -35,11 +54,18 @@ class GPTConfig:
 
 
 if MAIN:
-    config = GPTConfig(768, 12, 12, 50257, 1024)
+    config = FlaxGPTConfig(768, 12, 12, 50257, 1024)
     print(config)
 # %%
-class InnerGPTAttention(nn.Module):
-    config: GPTConfig
+class FlaxGPTInnerAttention(nn.Module):
+    """Attention layer for GPT-style transformer models. This is currently set up
+    for a single sequence - it'll be vmapped later to handle batches efficiently.
+
+    Args:
+        config: GPTConfig object containing the model configuration
+    """
+
+    config: FlaxGPTConfig
 
     def setup(self):
         self.qkv_proj = nn.Dense(self.config.d_model * 3)
@@ -68,13 +94,10 @@ class InnerGPTAttention(nn.Module):
             "seq (n_heads d_head) -> n_heads seq d_head",
             n_heads=self.config.n_heads,
         )
-        attn = jax.vmap(
-            lambda q, k: jnp.einsum(
-                "... q h, ... k h-> ... q k",
-                q,
-                k,
-            ),
-        )(q, k)
+        attn = jax.vmap(lambda q, k: jnp.einsum("... q h, ... k h-> ... q k", q, k,),)(
+            q,
+            k,
+        ) / jnp.sqrt(self.config.d_head)
         masked_attn = jnp.where(
             jnp.arange(seq_len)[:, None] >= jnp.arange(seq_len)[None, :],
             attn,
@@ -97,13 +120,19 @@ class InnerGPTAttention(nn.Module):
         return out
 
 
-class GPTAttention(nn.Module):
-    config: GPTConfig
+class FlaxGPTAttention(nn.Module):
+    """Batched attention layer for GPT-style transformer models.
+
+    Args:
+        config: GPTConfig object containing the model configuration
+    """
+
+    config: FlaxGPTConfig
 
     @nn.compact
     def __call__(self, x):
         return nn.vmap(
-            InnerGPTAttention,
+            FlaxGPTInnerAttention,
             in_axes=0,
             out_axes=0,
             variable_axes=dict(params=None),
@@ -114,15 +143,21 @@ class GPTAttention(nn.Module):
 if MAIN:
     key1, key2 = random.split(random.PRNGKey(0))
     x = random.normal(key1, (2, 5, 8))
-    config = GPTConfig(8, 2, 2, 10, 10)
-    attn_module = GPTAttention(config)
+    config = FlaxGPTConfig(8, 2, 2, 10, 10)
+    attn_module = FlaxGPTAttention(config)
     attn_module_params = attn_module.init(key2, x)
     out = attn_module.apply(attn_module_params, x)
     print(out.shape)
     print(out)
 # %%
-class GPTMLP(nn.Module):
-    config: GPTConfig
+class FlaxGPTMLP(nn.Module):
+    """MLP layer for GPT-style transformer models.
+
+    Args:
+        config: GPTConfig object containing the model configuration
+    """
+
+    config: FlaxGPTConfig
 
     def setup(self):
         assert self.config.mlp_dim
@@ -141,16 +176,24 @@ class GPTMLP(nn.Module):
 if MAIN:
     key1, key2 = random.split(random.PRNGKey(0))
     x = random.normal(key1, (2, 5, 8))
-    config = GPTConfig(8, 2, 2, 10, 10)
-    mlp_module = GPTMLP(config)
+    config = FlaxGPTConfig(8, 2, 2, 10, 10)
+    mlp_module = FlaxGPTMLP(config)
     mlp_module_params = mlp_module.init(key2, x)
     out = mlp_module.apply(mlp_module_params, x)
     print(out.shape)
     print(out)
 # %%
 class ResidualAndLayerNormConnection(nn.Module):
-    config: GPTConfig
-    inner_module: Union[GPTAttention, GPTMLP]
+    """Residual connection with layer normalization applied before the inner
+    module is applied.
+
+    Args:
+        config: GPTConfig object containing the model configuration
+        inner_module: Module wrapped by the residual and layer norm connection
+    """
+
+    config: FlaxGPTConfig
+    inner_module: Union[FlaxGPTAttention, FlaxGPTMLP]
 
     def setup(self):
         self.norm = nn.LayerNorm(self.config.layer_norm_eps)
@@ -162,9 +205,9 @@ class ResidualAndLayerNormConnection(nn.Module):
 if MAIN:
     key1, key2 = random.split(random.PRNGKey(0))
     x = random.normal(key1, (2, 5, 8))
-    config = GPTConfig(8, 2, 2, 10, 10)
-    attn_module = GPTAttention(config)
-    mlp_module = GPTMLP(config)
+    config = FlaxGPTConfig(8, 2, 2, 10, 10)
+    attn_module = FlaxGPTAttention(config)
+    mlp_module = FlaxGPTMLP(config)
     attn_norm_module = ResidualAndLayerNormConnection(config, attn_module)
     mlp_norm_module = ResidualAndLayerNormConnection(config, mlp_module)
     attn_norm_module_params = attn_norm_module.init(key2, x)
@@ -176,61 +219,88 @@ if MAIN:
     print(out_mlp.shape)
     print(out_mlp)
 # %%
-class GPTBlock(nn.Module):
-    config: GPTConfig
+class FlaxGPTBlock(nn.Module):
+    """GPT-style transformer block.
+
+    Args:
+        config: GPTConfig object containing the model configuration
+    """
+
+    config: FlaxGPTConfig
 
     def setup(self):
         self.attn = ResidualAndLayerNormConnection(
-            self.config, GPTAttention(self.config)
+            self.config,
+            FlaxGPTAttention(self.config),
         )
-        self.mlp = ResidualAndLayerNormConnection(self.config, GPTMLP(self.config))
+        if not self.config.attn_only:
+            self.mlp = ResidualAndLayerNormConnection(
+                self.config,
+                FlaxGPTMLP(self.config),
+            )
 
     def __call__(self, x):
-        return self.mlp(self.attn(x))
+        post_attn = self.attn(x)
+        if self.config.attn_only:
+            return post_attn
+        return self.mlp(post_attn)
 
 
 if MAIN:
     key1, key2 = random.split(random.PRNGKey(0))
     x = random.normal(key1, (2, 5, 8))
-    config = GPTConfig(8, 2, 2, 10, 10)
-    block_module = GPTBlock(config)
+    config = FlaxGPTConfig(8, 2, 2, 10, 10)
+    block_module = FlaxGPTBlock(config)
     block_module_params = block_module.init(key2, x)
     out = block_module.apply(block_module_params, x)
     print(out.shape)
     print(out)
 # %%
-class GPT(nn.Module):
-    config: GPTConfig
+class FlaxGPT(nn.Module):
+    """GPT-style transformer model.
+
+    Args:
+        config: GPTConfig object containing the model configuration
+    """
+
+    config: FlaxGPTConfig
 
     def setup(self):
         self.tok_embed = nn.Embed(self.config.d_vocab, self.config.d_model)
         self.pos_embed = nn.Embed(self.config.n_ctx, self.config.d_model)
-        self.blocks = [GPTBlock(self.config) for _ in range(self.config.n_layers)]
+        self.blocks = nn.Sequential(
+            [FlaxGPTBlock(self.config) for _ in range(self.config.n_layers)],
+        )
 
     def __call__(self, x):
         _, seq = x.shape
-        x = self.tok_embed(x) + self.pos_embed(jnp.arange(seq))
-        for block in self.blocks:
-            x = block(x)
-        return x
+        embed = self.tok_embed(x) + self.pos_embed(jnp.arange(seq))
+        post_blocks = self.blocks(embed)
+        return post_blocks
 
 
 if MAIN:
     key1, key2 = random.split(random.PRNGKey(0))
     x = random.randint(key1, (2, 5), 0, 10)
-    config = GPTConfig(8, 2, 2, 10, 10, 12)
-    gpt_module = GPT(config)
+    config = FlaxGPTConfig(8, 2, 2, 10, 10, 12)
+    gpt_module = FlaxGPT(config)
     gpt_module_params = gpt_module.init(key2, x)
     out = gpt_module.apply(gpt_module_params, x)
     print(out.shape)
     print(out)
 
 # %%
-class GPTLM(nn.Module):
-    config: GPTConfig
+class FlaxGPTLM(nn.Module):
+    """GPT-style transformer language model.
+
+    Args:
+        config: GPTConfig object containing the model configuration
+    """
+
+    config: FlaxGPTConfig
 
     def setup(self):
-        self.gpt = GPT(self.config)
+        self.gpt = FlaxGPT(self.config)
         self.ln_final = nn.LayerNorm(self.config.layer_norm_eps)
         self.lm_head = nn.Dense(self.config.d_vocab_out)
 
@@ -243,10 +313,10 @@ class GPTLM(nn.Module):
 if MAIN:
     key1, key2 = random.split(random.PRNGKey(0))
     x = random.randint(key1, (2, 5), 0, 10)
-    config = GPTConfig(8, 2, 2, 10, 10, 12)
-    gpt_module = GPTLM(config)
-    gpt_module_params = gpt_module.init(key2, x)
-    out = gpt_module.apply(gpt_module_params, x)
+    config = FlaxGPTConfig(8, 2, 2, 10, 10, 12)
+    gpt_lm_module = FlaxGPTLM(config)
+    gpt_lm_module_params = gpt_lm_module.init(key2, x)
+    out = gpt_lm_module.apply(gpt_lm_module_params, x)
     print(out.shape)
     print(out)
 # %%
