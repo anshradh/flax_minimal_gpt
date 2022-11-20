@@ -147,7 +147,8 @@ if MAIN:
     config = FlaxGPTConfig(8, 2, 2, 10, 10)
     attn_module = FlaxGPTAttention(config)
     attn_module_params = attn_module.init(key2, x)
-    out = attn_module.apply(attn_module_params, x)
+    jit_attn_module_apply = jax.jit(attn_module.apply)
+    out = jit_attn_module_apply(attn_module_params, x)
     assert out.shape == x.shape
 # %%
 class FlaxGPTMLP(nn.Module):
@@ -179,7 +180,8 @@ if MAIN:
     config = FlaxGPTConfig(8, 2, 2, 10, 10)
     mlp_module = FlaxGPTMLP(config)
     mlp_module_params = mlp_module.init(key2, x)
-    out = mlp_module.apply(mlp_module_params, x)
+    jit_mlp_module_apply = jax.jit(mlp_module.apply)
+    out = jit_mlp_module_apply(mlp_module_params, x)
     assert out.shape == x.shape
 # %%
 class ResidualAndLayerNormConnection(nn.Module):
@@ -211,8 +213,10 @@ if MAIN:
     mlp_norm_module = ResidualAndLayerNormConnection(config, mlp_module)
     attn_norm_module_params = attn_norm_module.init(key2, x)
     mlp_norm_module_params = mlp_norm_module.init(key2, x)
-    out_attn = attn_norm_module.apply(attn_norm_module_params, x)
-    out_mlp = mlp_norm_module.apply(mlp_norm_module_params, x)
+    jit_attn_norm_module_apply = jax.jit(attn_norm_module.apply)
+    jit_mlp_norm_module_apply = jax.jit(mlp_norm_module.apply)
+    out_attn = jit_attn_norm_module_apply(attn_norm_module_params, x)
+    out_mlp = jit_mlp_norm_module_apply(mlp_norm_module_params, x)
     assert out_attn.shape == x.shape
     assert out_mlp.shape == x.shape
 # %%
@@ -249,7 +253,8 @@ if MAIN:
     config = FlaxGPTConfig(8, 2, 2, 10, 10)
     block_module = FlaxGPTBlock(config)
     block_module_params = block_module.init(key2, x)
-    out = block_module.apply(block_module_params, x)
+    jit_block_module_apply = jax.jit(block_module.apply)
+    out = jit_block_module_apply(block_module_params, x)
     assert out.shape == x.shape
 # %%
 class FlaxGPT(nn.Module):
@@ -281,7 +286,8 @@ if MAIN:
     config = FlaxGPTConfig(8, 2, 2, 10, 10, 12)
     gpt_module = FlaxGPT(config)
     gpt_module_params = gpt_module.init(key2, x)
-    out = gpt_module.apply(gpt_module_params, x)
+    jit_gpt_module_apply = jax.jit(gpt_module.apply)
+    out = jit_gpt_module_apply(gpt_module_params, x)
     assert out.shape == x.shape + (config.d_model,)
 
 # %%
@@ -311,6 +317,7 @@ if MAIN:
     config = FlaxGPTConfig(8, 2, 2, 10, 10, 12)
     gpt_lm_module = FlaxGPTLM(config)
     gpt_lm_module_params = gpt_lm_module.init(key2, x)
-    out = gpt_lm_module.apply(gpt_lm_module_params, x)
+    jit_gpt_lm_module_apply = jax.jit(gpt_lm_module.apply)
+    out = jit_gpt_lm_module_apply(gpt_lm_module_params, x)
     assert out.shape == x.shape + (config.d_vocab_out,)
 # %%
