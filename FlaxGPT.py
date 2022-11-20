@@ -5,6 +5,7 @@ import flax.linen as nn
 from typing import Optional, Union
 from dataclasses import dataclass
 from einops import rearrange
+from fancy_einsum import einsum
 
 MAIN = __name__ == "__main__"
 # %%
@@ -77,7 +78,7 @@ class FlaxGPTInnerAttention(nn.Module):
         q_init, k_init, v_init = jnp.array_split(
             qkv,
             3,
-            axis=1,
+            axis=-1,
         )
         q = rearrange(
             q_init,
@@ -103,7 +104,7 @@ class FlaxGPTInnerAttention(nn.Module):
             attn,
             float("-inf"),
         )
-        softmaxed_attn = nn.softmax(masked_attn)
+        softmaxed_attn = nn.softmax(masked_attn, -1)
         combined_values = jax.vmap(
             lambda attn, v: jnp.einsum(
                 "... q k, ... k h -> ... q h",
@@ -147,8 +148,7 @@ if MAIN:
     attn_module = FlaxGPTAttention(config)
     attn_module_params = attn_module.init(key2, x)
     out = attn_module.apply(attn_module_params, x)
-    print(out.shape)
-    print(out)
+    assert out.shape == x.shape
 # %%
 class FlaxGPTMLP(nn.Module):
     """MLP layer for GPT-style transformer models.
@@ -180,8 +180,7 @@ if MAIN:
     mlp_module = FlaxGPTMLP(config)
     mlp_module_params = mlp_module.init(key2, x)
     out = mlp_module.apply(mlp_module_params, x)
-    print(out.shape)
-    print(out)
+    assert out.shape == x.shape
 # %%
 class ResidualAndLayerNormConnection(nn.Module):
     """Residual connection with layer normalization applied before the inner
@@ -214,10 +213,8 @@ if MAIN:
     mlp_norm_module_params = mlp_norm_module.init(key2, x)
     out_attn = attn_norm_module.apply(attn_norm_module_params, x)
     out_mlp = mlp_norm_module.apply(mlp_norm_module_params, x)
-    print(out_attn.shape)
-    print(out_attn)
-    print(out_mlp.shape)
-    print(out_mlp)
+    assert out_attn.shape == x.shape
+    assert out_mlp.shape == x.shape
 # %%
 class FlaxGPTBlock(nn.Module):
     """GPT-style transformer block.
@@ -253,8 +250,7 @@ if MAIN:
     block_module = FlaxGPTBlock(config)
     block_module_params = block_module.init(key2, x)
     out = block_module.apply(block_module_params, x)
-    print(out.shape)
-    print(out)
+    assert out.shape == x.shape
 # %%
 class FlaxGPT(nn.Module):
     """GPT-style transformer model.
@@ -286,8 +282,7 @@ if MAIN:
     gpt_module = FlaxGPT(config)
     gpt_module_params = gpt_module.init(key2, x)
     out = gpt_module.apply(gpt_module_params, x)
-    print(out.shape)
-    print(out)
+    assert out.shape == x.shape + (config.d_model,)
 
 # %%
 class FlaxGPTLM(nn.Module):
@@ -317,6 +312,5 @@ if MAIN:
     gpt_lm_module = FlaxGPTLM(config)
     gpt_lm_module_params = gpt_lm_module.init(key2, x)
     out = gpt_lm_module.apply(gpt_lm_module_params, x)
-    print(out.shape)
-    print(out)
+    assert out.shape == x.shape + (config.d_vocab_out,)
 # %%
