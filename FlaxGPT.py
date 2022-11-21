@@ -6,6 +6,7 @@ from typing import Optional, Union
 from dataclasses import dataclass
 from einops import rearrange
 from fancy_einsum import einsum
+from transformers import GPT2PreTrainedModel, GPT2TokenizerFast, GPT2LMHeadModel
 
 MAIN = __name__ == "__main__"
 # %%
@@ -306,18 +307,30 @@ class FlaxGPTLM(nn.Module):
         self.lm_head = nn.Dense(self.config.d_vocab_out)
 
     def __call__(self, x):
-        x = self.gpt(x)
-        x = self.ln_final(x)
-        return self.lm_head(x)
+        post_base = self.gpt(x)
+        post_final_ln = self.ln_final(post_base)
+        return self.lm_head(post_final_ln)
 
 
 if MAIN:
     key1, key2 = random.split(random.PRNGKey(0))
-    x = random.randint(key1, (2, 5), 0, 10)
-    config = FlaxGPTConfig(8, 2, 2, 10, 10, 12)
+    x = random.randint(key1, (10, 128), 0, 50257)
+    config = FlaxGPTConfig(768, 12, 12, 1024, 50257, 50257)
     gpt_lm_module = FlaxGPTLM(config)
     gpt_lm_module_params = gpt_lm_module.init(key2, x)
     jit_gpt_lm_module_apply = jax.jit(gpt_lm_module.apply)
     out = jit_gpt_lm_module_apply(gpt_lm_module_params, x)
     assert out.shape == x.shape + (config.d_vocab_out,)
+# %%
+# Test same output as Tranformers Model
+gpt2_small_hf = GPT2LMHeadModel.from_pretrained("gpt2")
+gpt2_small_hf.eval()
+gpt2_small_hf.to("cpu")
+gpt2_tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+
+# %%
+gpt2_tokenizer.pad_token = gpt2_tokenizer.eos_token
+gpt2_tokenizer.pad_token_id = gpt2_tokenizer.eos_token_id
+pt_tokenized = gpt2_tokenizer(["The dog caught the ball and", "The cat caught the mouse and"], padding=True, return_tensors="pt")
+jnp_tokenized = gpt2_tokenizer(["The dog caught the ball and", "The cat caught the mouse and"], padding=True, return_tensors="jax")
 # %%
