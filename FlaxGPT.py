@@ -140,7 +140,7 @@ class FlaxGPTAttention(nn.Module):
             out_axes=0,
             variable_axes=dict(params=None),
             split_rngs=dict(params=False),
-        )(config)(x)
+        )(self.config)(x)
 
 
 if MAIN:
@@ -207,8 +207,8 @@ class ResidualAndLayerNormConnection(nn.Module):
 
 if MAIN:
     key1, key2 = random.split(random.PRNGKey(0))
-    x = random.normal(key1, (2, 5, 8))
-    config = FlaxGPTConfig(8, 2, 2, 10, 10)
+    x = random.normal(key1, (2, 5, 16))
+    config = FlaxGPTConfig(16, 2, 2, 10, 10)
     attn_module = FlaxGPTAttention(config)
     mlp_module = FlaxGPTMLP(config)
     attn_norm_module = ResidualAndLayerNormConnection(config, attn_module)
@@ -251,8 +251,8 @@ class FlaxGPTBlock(nn.Module):
 
 if MAIN:
     key1, key2 = random.split(random.PRNGKey(0))
-    x = random.normal(key1, (2, 5, 8))
-    config = FlaxGPTConfig(8, 2, 2, 10, 10)
+    x = random.normal(key1, (2, 5, 32))
+    config = FlaxGPTConfig(32, 2, 2, 10, 10)
     block_module = FlaxGPTBlock(config)
     block_module_params = block_module.init(key2, x)
     jit_block_module_apply = jax.jit(block_module.apply)
@@ -285,7 +285,7 @@ class FlaxGPT(nn.Module):
 if MAIN:
     key1, key2 = random.split(random.PRNGKey(0))
     x = random.randint(key1, (2, 5), 0, 10)
-    config = FlaxGPTConfig(8, 2, 2, 10, 10, 12)
+    config = FlaxGPTConfig(24, 2, 2, 10, 10, 12)
     gpt_module = FlaxGPT(config)
     gpt_module_params = gpt_module.init(key2, x)
     jit_gpt_module_apply = jax.jit(gpt_module.apply)
@@ -316,7 +316,7 @@ class FlaxGPTLM(nn.Module):
 if MAIN:
     key1, key2 = random.split(random.PRNGKey(0))
     x = random.randint(key1, (10, 10), 0, 10)
-    config = FlaxGPTConfig(768, 12, 12, 1024, 50257)
+    config = FlaxGPTConfig(16, 2, 2, 10, 10)
     gpt_lm_module = FlaxGPTLM(config)
     gpt_lm_module_params = gpt_lm_module.init(key2, x)
     jit_gpt_lm_module_apply = jax.jit(gpt_lm_module.apply)
@@ -351,7 +351,6 @@ def to_frozen(x):
     return x
 
 
-# %%
 if MAIN:
     key = random.PRNGKey(0)
     flax_gpt2_small_config = FlaxGPTConfig(768, 12, 12, 1024, 50257)
@@ -359,9 +358,8 @@ if MAIN:
     flax_gpt2_small_params = jax.jit(flax_gpt2_small.init)(
         key, jnp_tokenized["input_ids"]
     )
-# %%
-if MAIN:
     jit_flax_gpt2_small_apply = jax.jit(flax_gpt2_small.apply)
+
     new_flax_gpt2_small_params = dict(
         params=dict(
             gpt=dict(
