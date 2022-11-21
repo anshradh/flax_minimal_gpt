@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from einops import rearrange
 from fancy_einsum import einsum
 from transformers import GPT2PreTrainedModel, GPT2TokenizerFast, GPT2LMHeadModel
+from flax.core import FrozenDict
 
 MAIN = __name__ == "__main__"
 # %%
@@ -314,8 +315,8 @@ class FlaxGPTLM(nn.Module):
 
 if MAIN:
     key1, key2 = random.split(random.PRNGKey(0))
-    x = random.randint(key1, (10, 128), 0, 50257)
-    config = FlaxGPTConfig(768, 12, 12, 1024, 50257, 50257)
+    x = random.randint(key1, (10, 10), 0, 10)
+    config = FlaxGPTConfig(768, 12, 12, 1024, 50257)
     gpt_lm_module = FlaxGPTLM(config)
     gpt_lm_module_params = gpt_lm_module.init(key2, x)
     jit_gpt_lm_module_apply = jax.jit(gpt_lm_module.apply)
@@ -323,14 +324,72 @@ if MAIN:
     assert out.shape == x.shape + (config.d_vocab_out,)
 # %%
 # Test same output as Tranformers Model
-gpt2_small_hf = GPT2LMHeadModel.from_pretrained("gpt2")
-gpt2_small_hf.eval()
-gpt2_small_hf.to("cpu")
-gpt2_tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-
+if MAIN:
+    gpt2_small_hf = GPT2LMHeadModel.from_pretrained("gpt2")
+    gpt2_small_hf.eval()
+    gpt2_small_hf.to("cpu")
+    gpt2_tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+    gpt2_tokenizer.pad_token = gpt2_tokenizer.eos_token
+    gpt2_tokenizer.pad_token_id = gpt2_tokenizer.eos_token_id
+    pt_tokenized = gpt2_tokenizer(["The dog caught the ball and", "The cat caught the mouse and"], padding=True, return_tensors="pt")
+    jnp_tokenized = gpt2_tokenizer(["The dog caught the ball and", "The cat caught the mouse and"], padding=True, return_tensors="jax")
+    hf_text = gpt2_tokenizer.batch_decode(gpt2_small_hf(pt_tokenized["input_ids"])["logits"].argmax(-1))
 # %%
-gpt2_tokenizer.pad_token = gpt2_tokenizer.eos_token
-gpt2_tokenizer.pad_token_id = gpt2_tokenizer.eos_token_id
-pt_tokenized = gpt2_tokenizer(["The dog caught the ball and", "The cat caught the mouse and"], padding=True, return_tensors="pt")
-jnp_tokenized = gpt2_tokenizer(["The dog caught the ball and", "The cat caught the mouse and"], padding=True, return_tensors="jax")
+def to_frozen(x):
+    if hasattr(x, "keys"):
+        return FrozenDict({k: to_frozen(v) for k, v in x.items()})
+    return x
+# %%
+if MAIN:
+    key = random.PRNGKey(0)
+    flax_gpt2_small_config = FlaxGPTConfig(768, 12, 12, 1024, 50257)
+    flax_gpt2_small = FlaxGPTLM(flax_gpt2_small_config)
+    flax_gpt2_small_params = jax.jit(flax_gpt2_small.init)(key, jnp_tokenized["input_ids"])
+# %%
+if MAIN:
+    jit_flax_gpt2_small_apply = jax.jit(flax_gpt2_small.apply)
+    new_flax_gpt2_small_params = dict(params=dict(gpt=dict(tok_embed=dict(), pos_embed=dict(), blocks=dict(layers_0=dict(attn=dict(norm=dict(), inner_module=dict(VmapFlaxGPTInnerAttention_0=dict(out_proj=dict(), qkv_proj=dict()))), mlp=dict(norm=dict(), inner_module=dict(ff_1=dict(), ff_2=dict()))), layers_1=dict(attn=dict(norm=dict(), inner_module=dict(VmapFlaxGPTInnerAttention_0=dict(out_proj=dict(), qkv_proj=dict()))), mlp=dict(norm=dict(), inner_module=dict(ff_1=dict(), ff_2=dict()))), layers_2=dict(attn=dict(norm=dict(), inner_module=dict(VmapFlaxGPTInnerAttention_0=dict(out_proj=dict(), qkv_proj=dict()))), mlp=dict(norm=dict(), inner_module=dict(ff_1=dict(), ff_2=dict()))), layers_3=dict(attn=dict(norm=dict(), inner_module=dict(VmapFlaxGPTInnerAttention_0=dict(out_proj=dict(), qkv_proj=dict()))), mlp=dict(norm=dict(), inner_module=dict(ff_1=dict(), ff_2=dict()))), layers_4=dict(attn=dict(norm=dict(), inner_module=dict(VmapFlaxGPTInnerAttention_0=dict(out_proj=dict(), qkv_proj=dict()))), mlp=dict(norm=dict(), inner_module=dict(ff_1=dict(), ff_2=dict()))), layers_5=dict(attn=dict(norm=dict(), inner_module=dict(VmapFlaxGPTInnerAttention_0=dict(out_proj=dict(), qkv_proj=dict()))), mlp=dict(norm=dict(), inner_module=dict(ff_1=dict(), ff_2=dict()))), layers_6=dict(attn=dict(norm=dict(), inner_module=dict(VmapFlaxGPTInnerAttention_0=dict(out_proj=dict(), qkv_proj=dict()))), mlp=dict(norm=dict(), inner_module=dict(ff_1=dict(), ff_2=dict()))), layers_7=dict(attn=dict(norm=dict(), inner_module=dict(VmapFlaxGPTInnerAttention_0=dict(out_proj=dict(), qkv_proj=dict()))), mlp=dict(norm=dict(), inner_module=dict(ff_1=dict(), ff_2=dict()))), layers_8=dict(attn=dict(norm=dict(), inner_module=dict(VmapFlaxGPTInnerAttention_0=dict(out_proj=dict(), qkv_proj=dict()))), mlp=dict(norm=dict(), inner_module=dict(ff_1=dict(), ff_2=dict()))), layers_9=dict(attn=dict(norm=dict(), inner_module=dict(VmapFlaxGPTInnerAttention_0=dict(out_proj=dict(), qkv_proj=dict()))), mlp=dict(norm=dict(), inner_module=dict(ff_1=dict(), ff_2=dict()))), layers_10=dict(attn=dict(norm=dict(), inner_module=dict(VmapFlaxGPTInnerAttention_0=dict(out_proj=dict(), qkv_proj=dict()))), mlp=dict(norm=dict(), inner_module=dict(ff_1=dict(), ff_2=dict()))), layers_11=dict(attn=dict(norm=dict(), inner_module=dict(VmapFlaxGPTInnerAttention_0=dict(out_proj=dict(), qkv_proj=dict()))), mlp=dict(norm=dict(), inner_module=dict(ff_1=dict(), ff_2=dict()))))), ln_final=dict(), lm_head=dict()),)
+    for param_name, param in gpt2_small_hf.state_dict().items():
+        if param_name == "transformer.wte.weight":
+            new_flax_gpt2_small_params["params"]["gpt"]["tok_embed"]["embedding"] = jnp.array(param.cpu().numpy())
+        if param_name == "transformer.wpe.weight":
+            new_flax_gpt2_small_params["params"]["gpt"]["pos_embed"]["embedding"] = jnp.array(param.cpu().numpy())
+        if param_name.split(".")[1] == "h":
+            block_num = int(param_name.split(".")[2])
+            if "ln_1.weight" in param_name:
+                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][f"layers_{block_num}"]["attn"]["norm"]["scale"] = jnp.array(param.cpu().numpy())
+            if "ln_1.bias" in param_name:
+                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][f"layers_{block_num}"]["attn"]["norm"]["bias"] = jnp.array(param.cpu().numpy())
+            if "attn.c_attn.weight" in param_name:
+                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][f"layers_{block_num}"]["attn"]["inner_module"]["VmapFlaxGPTInnerAttention_0"]["qkv_proj"]["kernel"] = jnp.array(param.cpu().numpy())
+            if "attn.c_attn.bias" in param_name:
+                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][f"layers_{block_num}"]["attn"]["inner_module"]["VmapFlaxGPTInnerAttention_0"]["qkv_proj"]["bias"] = jnp.array(param.cpu().numpy())
+            if "attn.c_proj.weight" in param_name:
+                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][f"layers_{block_num}"]["attn"]["inner_module"]["VmapFlaxGPTInnerAttention_0"]["out_proj"]["kernel"] = jnp.array(param.cpu().numpy())
+            if "attn.c_proj.bias" in param_name:
+                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][f"layers_{block_num}"]["attn"]["inner_module"]["VmapFlaxGPTInnerAttention_0"]["out_proj"]["bias"] = jnp.array(param.cpu().numpy())
+            if "ln_2.weight" in param_name:
+                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][f"layers_{block_num}"]["mlp"]["norm"]["scale"] = jnp.array(param.cpu().numpy())
+            if "ln_2.bias" in param_name:
+                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][f"layers_{block_num}"]["mlp"]["norm"]["bias"] = jnp.array(param.cpu().numpy())
+            if "mlp.c_fc.weight" in param_name:
+                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][f"layers_{block_num}"]["mlp"]["inner_module"]["ff_1"]["kernel"] = jnp.array(param.cpu().numpy())
+            if "mlp.c_fc.bias" in param_name:
+                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][f"layers_{block_num}"]["mlp"]["inner_module"]["ff_1"]["bias"] = jnp.array(param.cpu().numpy())
+            if "mlp.c_proj.weight" in param_name:
+                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][f"layers_{block_num}"]["mlp"]["inner_module"]["ff_2"]["kernel"] = jnp.array(param.cpu().numpy())
+            if "mlp.c_proj.bias" in param_name:
+                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][f"layers_{block_num}"]["mlp"]["inner_module"]["ff_2"]["bias"] = jnp.array(param.cpu().numpy())
+        if "ln_f.weight" in param_name:
+            new_flax_gpt2_small_params["params"]["ln_final"]["scale"] = jnp.array(param.cpu().numpy())
+        if "ln_f.bias" in param_name:
+            new_flax_gpt2_small_params["params"]["ln_final"]["bias"] = jnp.array(param.cpu().numpy())
+        if "lm_head.weight" in param_name:
+            new_flax_gpt2_small_params["params"]["lm_head"]["kernel"] = jnp.array(param.cpu().numpy()).T
+    new_flax_gpt2_small_params["params"]["lm_head"]["bias"] = jnp.zeros_like(flax_gpt2_small_params["params"]["lm_head"]["bias"])
+    frozen_params = to_frozen(new_flax_gpt2_small_params)
+    jax_outputs = jit_flax_gpt2_small_apply(frozen_params, jnp_tokenized["input_ids"], )
+    jax_ids = jnp.argmax(jax_outputs, axis=-1)
+    jax_text = gpt2_tokenizer.batch_decode(jax_ids, skip_special_tokens=True)
+    assert jax_text == hf_text
 # %%
