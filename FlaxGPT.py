@@ -29,6 +29,7 @@ class FlaxGPTConfig:
         activation: Activation function to use in the transformer block. Defaults
             to "gelu" - only relu and gelu are currently supported.
         bidirectional: If True, use a bidirectional transformer block
+        n_classes: Number of classes for classification, defaults to self.d_vocab_out.
 
     """
 
@@ -43,6 +44,7 @@ class FlaxGPTConfig:
     mlp_dim: Optional[int] = None
     activation: Optional[str] = None
     bidirectional: bool = False
+    n_classes: Optional[int] = None
 
     def __post_init__(self):
         self.d_head = self.d_model // self.n_heads
@@ -56,6 +58,8 @@ class FlaxGPTConfig:
                     self.activation == "gelu" or self.activation == "relu"
                 ), "Only GELU and ReLU Activations supported right now."
         self.d_vocab_out = self.d_vocab_out or self.d_vocab
+        if self.bidirectional and not self.n_classes:
+            self.n_classes = self.d_vocab_out
 
 
 if MAIN:
@@ -462,7 +466,7 @@ if MAIN:
         pass
 # %%
 class FlaxGPTClasifier(nn.Module):
-    """GPT-style transformer classifier.
+    """GPT-style transformer classifier. Returns logits at the first sequence position.
 
     Args:
         config: GPTConfig object containing the model configuration
@@ -479,11 +483,41 @@ class FlaxGPTClasifier(nn.Module):
         self.ln_final = nn.LayerNorm(self.config.layer_norm_eps)
         self.classifier_head = nn.Dense(self.config.n_classes)
 
-    def __call__(self, x):
-        post_base = self.gpt(x)
+    def __call__(self, x, padding_mask):
+        post_base = self.gpt(x, padding_mask)
         post_final_ln = self.ln_final(post_base)
-        return self.classifier(post_final_ln)
+        return self.classifier_head(post_final_ln)[:, 0]
 
+
+if MAIN:
+    key1, key2 = random.split(random.PRNGKey(0))
+    x = random.randint(key1, (2, 5), 0, 10)
+    config = FlaxGPTConfig(16, 2, 2, 10, 10, bidirectional=True, n_classes=2)
+    gpt_classifier_module = FlaxGPTClasifier(config)
+    padding_mask = rearrange(
+        jnp.array(
+            [
+                [True, True, True, False, False],
+                [True, True, False, False, False],
+            ],
+        ),
+        "batch seq -> batch 1 seq 1",
+    )
+    gpt_classifier_module_params = gpt_classifier_module.init(key2, x, padding_mask)
+    jit_gpt_classifier_module_apply = jax.jit(gpt_classifier_module.apply)
+    out = jit_gpt_classifier_module_apply(gpt_classifier_module_params, x, padding_mask)
+    assert out.shape == (x.shape[0], config.n_classes)
+    unidirectional_config = FlaxGPTConfig(
+        16,
+        2,
+        2,
+        10,
+        10,
+    )
+    try:
+        unidirectional_gpt_classifier_module = FlaxGPTClasifier(unidirectional_config)
+    except AssertionError:
+        pass
 
 # %%
 # Test same output as Tranformers Model
