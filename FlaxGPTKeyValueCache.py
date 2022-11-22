@@ -1,11 +1,13 @@
 # %%
 import jax.numpy as jnp
 import jax
+from brax import pytree
 from dataclasses import dataclass
 from FlaxGPTConfig import FlaxGPTConfig
 from typing import List
 
 
+@pytree.register
 @dataclass
 class FlaxGPTKeyValueCacheEntry:
     """Data class for storing past keys and values for an attention layer.
@@ -24,6 +26,7 @@ class FlaxGPTKeyValueCacheEntry:
         return self.keys, self.values
 
 
+@pytree.register
 @dataclass
 class FlaxGPTKeyValueCache:
     """Class storing past key and value vectors for a GPT model."""

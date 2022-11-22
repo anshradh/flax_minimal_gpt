@@ -103,10 +103,10 @@ if MAIN:
     )
     attn_module_params = attn_module.init(key2, x)
     jit_attn_module_apply = jax.jit(attn_module.apply)
-    out = attn_module.apply(attn_module_params, x, cache_entry)
+    out = jit_attn_module_apply(attn_module_params, x, cache_entry)
     assert out.shape == x.shape
     x_n = random.normal(key1, (2, 1, 8))
-    out_n = attn_module.apply(attn_module_params, x_n, cache_entry)
+    out_n = jit_attn_module_apply(attn_module_params, x_n, cache_entry)
     assert out_n.shape == x_n.shape
     bidirectional_config = FlaxGPTConfig(8, 2, 2, 10, 10, bidirectional=True)
     bidirectional_attn_module = FlaxGPTAttention(bidirectional_config)
@@ -205,14 +205,14 @@ if MAIN:
     )
     attn_norm_module_params = attn_norm_module.init(key2, x)
     mlp_norm_module_params = mlp_norm_module.init(key2, x)
-    # attn_norm_module.apply = jax.jit(attn_norm_module.apply)
+    jit_attn_norm_module_apply = jax.jit(attn_norm_module.apply)
     jit_mlp_norm_module_apply = jax.jit(mlp_norm_module.apply)
-    out_attn = attn_norm_module.apply(attn_norm_module_params, x, cache_entry)
+    out_attn = jit_attn_norm_module_apply(attn_norm_module_params, x, cache_entry)
     out_mlp = jit_mlp_norm_module_apply(mlp_norm_module_params, x)
     assert out_attn.shape == x.shape
     assert out_mlp.shape == x.shape
     x_n = random.normal(key1, (2, 1, 16))
-    out_attn_n = attn_norm_module.apply(attn_norm_module_params, x_n, cache_entry)
+    out_attn_n = jit_attn_norm_module_apply(attn_norm_module_params, x_n, cache_entry)
     assert out_attn_n.shape == x_n.shape
     bidirectional_config = FlaxGPTConfig(16, 2, 2, 10, 10, bidirectional=True)
     bidirectional_attn_module = FlaxGPTAttention(bidirectional_config)
@@ -266,8 +266,10 @@ class FlaxGPTBlock(nn.Module):
                 FlaxGPTMLP(self.config),
             )
 
-    def __call__(self, x, padding_mask=None):
-        post_attn = self.attn(x, padding_mask)
+    def __call__(
+        self, x, cache: Optional[FlaxGPTKeyValueCacheEntry] = None, padding_mask=None
+    ):
+        post_attn = self.attn(x, cache, padding_mask)
         if self.config.attn_only:
             return post_attn
         return self.mlp(post_attn)
@@ -279,9 +281,16 @@ if MAIN:
     config = FlaxGPTConfig(32, 2, 2, 10, 10)
     block_module = FlaxGPTBlock(config)
     block_module_params = block_module.init(key2, x)
+    cache_entry = FlaxGPTKeyValueCacheEntry(
+        keys=jnp.empty((2, 2, 0, 16)),
+        values=jnp.empty((2, 2, 0, 16)),
+    )
     jit_block_module_apply = jax.jit(block_module.apply)
-    out = jit_block_module_apply(block_module_params, x)
+    out = jit_block_module_apply(block_module_params, x, cache_entry)
     assert out.shape == x.shape
+    x_n = random.normal(key1, (2, 1, 32))
+    out_n = jit_block_module_apply(block_module_params, x_n, cache_entry)
+    assert out_n.shape == x_n.shape
     bidirectional_config = FlaxGPTConfig(32, 2, 2, 10, 10, bidirectional=True)
     bidirectional_block_module = FlaxGPTBlock(bidirectional_config)
     padding_mask = rearrange(
@@ -296,6 +305,7 @@ if MAIN:
     bidirectional_block_module_params = bidirectional_block_module.init(
         key2,
         x,
+        None,
         padding_mask,
     )
     jit_bidirectional_block_module_apply = jax.jit(
@@ -304,6 +314,7 @@ if MAIN:
     out = jit_bidirectional_block_module_apply(
         bidirectional_block_module_params,
         x,
+        None,
         padding_mask,
     )
     assert out.shape == x.shape
@@ -323,11 +334,16 @@ class FlaxGPT(nn.Module):
         self.pos_embed = nn.Embed(self.config.n_ctx, self.config.d_model)
         self.blocks = [FlaxGPTBlock(self.config) for _ in range(self.config.n_layers)]
 
-    def __call__(self, x, padding_mask=None):
+    def __call__(
+        self, x, cache: Optional[FlaxGPTKeyValueCache] = None, padding_mask=None
+    ):
         _, seq = x.shape
         x = self.tok_embed(x) + self.pos_embed(jnp.arange(seq))
-        for block in self.blocks:
-            x = block(x, padding_mask)
+        for i, block in enumerate(self.blocks):
+            if cache is not None:
+                x = block(x, cache[i], padding_mask)
+            else:
+                x = block(x, None, padding_mask)
         return x
 
 
@@ -338,8 +354,12 @@ if MAIN:
     gpt_module = FlaxGPT(config)
     gpt_module_params = gpt_module.init(key2, x)
     jit_gpt_module_apply = jax.jit(gpt_module.apply)
-    out = jit_gpt_module_apply(gpt_module_params, x)
+    cache = FlaxGPTKeyValueCache.init_cache(config, 2)
+    out = jit_gpt_module_apply(gpt_module_params, x, cache)
     assert out.shape == x.shape + (config.d_model,)
+    x_n = random.randint(key1, (2, 1), 0, 10)
+    out_n = jit_gpt_module_apply(gpt_module_params, x_n, cache)
+    assert out_n.shape == x_n.shape + (config.d_model,)
     bidirectional_config = FlaxGPTConfig(
         24,
         2,
@@ -362,6 +382,7 @@ if MAIN:
     bidirectional_gpt_module_params = bidirectional_gpt_module.init(
         key2,
         x,
+        None,
         padding_mask,
     )
     jit_bidirectional_gpt_module_apply = jax.jit(
@@ -370,6 +391,7 @@ if MAIN:
     out = jit_bidirectional_gpt_module_apply(
         bidirectional_gpt_module_params,
         x,
+        None,
         padding_mask,
     )
     assert out.shape == x.shape + (bidirectional_config.d_model,)
@@ -395,8 +417,8 @@ class FlaxGPTLM(nn.Module):
         self.ln_final = nn.LayerNorm(self.config.layer_norm_eps)
         self.lm_head = nn.Dense(self.config.d_vocab_out)
 
-    def __call__(self, x):
-        post_base = self.gpt(x)
+    def __call__(self, x, cache: Optional[FlaxGPTKeyValueCache] = None):
+        post_base = self.gpt(x, cache)
         post_final_ln = self.ln_final(post_base)
         return self.lm_head(post_final_ln)
 
@@ -408,8 +430,12 @@ if MAIN:
     gpt_lm_module = FlaxGPTLM(config)
     gpt_lm_module_params = gpt_lm_module.init(key2, x)
     jit_gpt_lm_module_apply = jax.jit(gpt_lm_module.apply)
-    out = jit_gpt_lm_module_apply(gpt_lm_module_params, x)
+    cache = FlaxGPTKeyValueCache.init_cache(config, 10)
+    out = jit_gpt_lm_module_apply(gpt_lm_module_params, x, cache)
     assert out.shape == x.shape + (config.d_vocab_out,)
+    x_n = random.randint(key1, (10, 1), 0, 10)
+    out_n = jit_gpt_lm_module_apply(gpt_lm_module_params, x_n, cache)
+    assert out_n.shape == x_n.shape + (config.d_vocab_out,)
     bidirectional_config = FlaxGPTConfig(
         16,
         2,
@@ -442,7 +468,7 @@ class FlaxGPTClasifier(nn.Module):
         self.classifier_head = nn.Dense(self.config.n_classes)
 
     def __call__(self, x, padding_mask):
-        post_base = self.gpt(x, padding_mask)
+        post_base = self.gpt(x, padding_mask=padding_mask)
         post_final_ln = self.ln_final(post_base)
         return self.classifier_head(post_final_ln)[:, 0]
 
@@ -506,6 +532,7 @@ def to_frozen(x):
     return x
 
 
+# %%
 if MAIN:
     key = random.PRNGKey(0)
     flax_gpt2_small_config = FlaxGPTConfig(768, 12, 12, 1024, 50257)
@@ -514,7 +541,8 @@ if MAIN:
         key, jnp_tokenized["input_ids"]
     )
     jit_flax_gpt2_small_apply = jax.jit(flax_gpt2_small.apply)
-
+# %%
+if MAIN:
     new_flax_gpt2_small_params = dict(
         params=dict(
             gpt=dict(
@@ -524,10 +552,8 @@ if MAIN:
                     attn=dict(
                         norm=dict(),
                         inner_module=dict(
-                            VmapFlaxGPTInnerAttention_0=dict(
-                                out_proj=dict(),
-                                qkv_proj=dict(),
-                            ),
+                            out_proj=dict(),
+                            qkv_proj=dict(),
                         ),
                     ),
                     mlp=dict(
@@ -542,10 +568,8 @@ if MAIN:
                     attn=dict(
                         norm=dict(),
                         inner_module=dict(
-                            VmapFlaxGPTInnerAttention_0=dict(
-                                out_proj=dict(),
-                                qkv_proj=dict(),
-                            ),
+                            out_proj=dict(),
+                            qkv_proj=dict(),
                         ),
                     ),
                     mlp=dict(
@@ -560,10 +584,8 @@ if MAIN:
                     attn=dict(
                         norm=dict(),
                         inner_module=dict(
-                            VmapFlaxGPTInnerAttention_0=dict(
-                                out_proj=dict(),
-                                qkv_proj=dict(),
-                            ),
+                            out_proj=dict(),
+                            qkv_proj=dict(),
                         ),
                     ),
                     mlp=dict(
@@ -578,10 +600,8 @@ if MAIN:
                     attn=dict(
                         norm=dict(),
                         inner_module=dict(
-                            VmapFlaxGPTInnerAttention_0=dict(
-                                out_proj=dict(),
-                                qkv_proj=dict(),
-                            ),
+                            out_proj=dict(),
+                            qkv_proj=dict(),
                         ),
                     ),
                     mlp=dict(
@@ -596,10 +616,8 @@ if MAIN:
                     attn=dict(
                         norm=dict(),
                         inner_module=dict(
-                            VmapFlaxGPTInnerAttention_0=dict(
-                                out_proj=dict(),
-                                qkv_proj=dict(),
-                            ),
+                            out_proj=dict(),
+                            qkv_proj=dict(),
                         ),
                     ),
                     mlp=dict(
@@ -614,10 +632,8 @@ if MAIN:
                     attn=dict(
                         norm=dict(),
                         inner_module=dict(
-                            VmapFlaxGPTInnerAttention_0=dict(
-                                out_proj=dict(),
-                                qkv_proj=dict(),
-                            ),
+                            out_proj=dict(),
+                            qkv_proj=dict(),
                         ),
                     ),
                     mlp=dict(
@@ -632,10 +648,8 @@ if MAIN:
                     attn=dict(
                         norm=dict(),
                         inner_module=dict(
-                            VmapFlaxGPTInnerAttention_0=dict(
-                                out_proj=dict(),
-                                qkv_proj=dict(),
-                            ),
+                            out_proj=dict(),
+                            qkv_proj=dict(),
                         ),
                     ),
                     mlp=dict(
@@ -650,10 +664,8 @@ if MAIN:
                     attn=dict(
                         norm=dict(),
                         inner_module=dict(
-                            VmapFlaxGPTInnerAttention_0=dict(
-                                out_proj=dict(),
-                                qkv_proj=dict(),
-                            ),
+                            out_proj=dict(),
+                            qkv_proj=dict(),
                         ),
                     ),
                     mlp=dict(
@@ -668,10 +680,8 @@ if MAIN:
                     attn=dict(
                         norm=dict(),
                         inner_module=dict(
-                            VmapFlaxGPTInnerAttention_0=dict(
-                                out_proj=dict(),
-                                qkv_proj=dict(),
-                            ),
+                            out_proj=dict(),
+                            qkv_proj=dict(),
                         ),
                     ),
                     mlp=dict(
@@ -686,10 +696,8 @@ if MAIN:
                     attn=dict(
                         norm=dict(),
                         inner_module=dict(
-                            VmapFlaxGPTInnerAttention_0=dict(
-                                out_proj=dict(),
-                                qkv_proj=dict(),
-                            ),
+                            out_proj=dict(),
+                            qkv_proj=dict(),
                         ),
                     ),
                     mlp=dict(
@@ -704,10 +712,8 @@ if MAIN:
                     attn=dict(
                         norm=dict(),
                         inner_module=dict(
-                            VmapFlaxGPTInnerAttention_0=dict(
-                                out_proj=dict(),
-                                qkv_proj=dict(),
-                            ),
+                            out_proj=dict(),
+                            qkv_proj=dict(),
                         ),
                     ),
                     mlp=dict(
@@ -722,10 +728,8 @@ if MAIN:
                     attn=dict(
                         norm=dict(),
                         inner_module=dict(
-                            VmapFlaxGPTInnerAttention_0=dict(
-                                out_proj=dict(),
-                                qkv_proj=dict(),
-                            ),
+                            out_proj=dict(),
+                            qkv_proj=dict(),
                         ),
                     ),
                     mlp=dict(
@@ -771,33 +775,23 @@ if MAIN:
             if "attn.c_attn.weight" in param_name:
                 new_flax_gpt2_small_params["params"]["gpt"][f"blocks_{block_num}"][
                     "attn"
-                ]["inner_module"]["VmapFlaxGPTInnerAttention_0"]["qkv_proj"][
-                    "kernel"
-                ] = jnp.array(
+                ]["inner_module"]["qkv_proj"]["kernel"] = jnp.array(
                     param.cpu().numpy(),
                 )
             if "attn.c_attn.bias" in param_name:
                 new_flax_gpt2_small_params["params"]["gpt"][f"blocks_{block_num}"][
                     "attn"
-                ]["inner_module"]["VmapFlaxGPTInnerAttention_0"]["qkv_proj"][
-                    "bias"
-                ] = jnp.array(
-                    param.cpu().numpy()
-                )
+                ]["inner_module"]["qkv_proj"]["bias"] = jnp.array(param.cpu().numpy())
             if "attn.c_proj.weight" in param_name:
                 new_flax_gpt2_small_params["params"]["gpt"][f"blocks_{block_num}"][
                     "attn"
-                ]["inner_module"]["VmapFlaxGPTInnerAttention_0"]["out_proj"][
-                    "kernel"
-                ] = jnp.array(
+                ]["inner_module"]["out_proj"]["kernel"] = jnp.array(
                     param.cpu().numpy(),
                 )
             if "attn.c_proj.bias" in param_name:
                 new_flax_gpt2_small_params["params"]["gpt"][f"blocks_{block_num}"][
                     "attn"
-                ]["inner_module"]["VmapFlaxGPTInnerAttention_0"]["out_proj"][
-                    "bias"
-                ] = jnp.array(
+                ]["inner_module"]["out_proj"]["bias"] = jnp.array(
                     param.cpu().numpy(),
                 )
             if "ln_2.weight" in param_name:
@@ -852,9 +846,13 @@ if MAIN:
         flax_gpt2_small_params["params"]["lm_head"]["bias"],
     )
     frozen_params = to_frozen(new_flax_gpt2_small_params)
+# %%
+if MAIN:
+    cache = FlaxGPTKeyValueCache.init_cache(flax_gpt2_small_config, 2)
     jax_outputs = jit_flax_gpt2_small_apply(
         frozen_params,
         jnp_tokenized["input_ids"],
+        cache,
     )
     jax_ids = jnp.argmax(jax_outputs, axis=-1)
     jax_text = gpt2_tokenizer.batch_decode(jax_ids, skip_special_tokens=True)
