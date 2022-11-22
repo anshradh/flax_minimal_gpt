@@ -8,67 +8,14 @@ from einops import rearrange
 from fancy_einsum import einsum
 from transformers import GPT2PreTrainedModel, GPT2TokenizerFast, GPT2LMHeadModel
 from flax.core import FrozenDict
+from FlaxGPTConfig import FlaxGPTConfig
+from FlaxGPTKeyValueCache import FlaxGPTKeyValueCache, FlaxGPTKeyValueCacheEntry
 
 MAIN = __name__ == "__main__"
+
 # %%
-@dataclass
-class FlaxGPTConfig:
-    """Dataclass for configuring a GPT-style transformer model.
-
-    Args:
-        d_model: Dimensionality of the residual stream
-        n_heads: Number of attention heads
-        n_layers: Number of transformer blocks
-        n_ctx: Max number of tokens in the context
-        d_vocab: Dimensionality of the input token embedding
-        d_vocab_out: Dimensionality of the output token embedding
-        layer_norm_eps: Epsilon for layer normalization
-        attn_only: If True, only use attention layers for each transformer block
-        mlp_dim: Dimensionality of the MLP layer in the transformer block. Defaults
-            to 4 * d_model
-        activation: Activation function to use in the transformer block. Defaults
-            to "gelu" - only relu and gelu are currently supported.
-        bidirectional: If True, use a bidirectional transformer block
-        n_classes: Number of classes for classification, defaults to self.d_vocab_out.
-
-    """
-
-    d_model: int
-    n_heads: int
-    n_layers: int
-    n_ctx: int
-    d_vocab: int
-    d_vocab_out: Optional[int] = None
-    layer_norm_eps: float = 1e-5
-    attn_only: bool = False
-    mlp_dim: Optional[int] = None
-    activation: Optional[str] = None
-    bidirectional: bool = False
-    n_classes: Optional[int] = None
-
-    def __post_init__(self):
-        self.d_head = self.d_model // self.n_heads
-        if not self.attn_only:
-            if not self.mlp_dim:
-                self.mlp_dim = 4 * self.d_model
-            if not self.activation:
-                self.activation = "gelu"
-            else:
-                assert (
-                    self.activation == "gelu" or self.activation == "relu"
-                ), "Only GELU and ReLU Activations supported right now."
-        self.d_vocab_out = self.d_vocab_out or self.d_vocab
-        if self.bidirectional and not self.n_classes:
-            self.n_classes = self.d_vocab_out
-
-
-if MAIN:
-    config = FlaxGPTConfig(768, 12, 12, 50257, 1024)
-    print(config)
-# %%
-class FlaxGPTInnerAttention(nn.Module):
-    """Attention layer for GPT-style transformer models. This is currently set up
-    for a single sequence - it'll be vmapped later to handle batches efficiently.
+class FlaxGPTAttention(nn.Module):
+    """Attention layer for GPT-style transformer models.
 
     Args:
         config: GPTConfig object containing the model configuration
@@ -80,8 +27,10 @@ class FlaxGPTInnerAttention(nn.Module):
         self.qkv_proj = nn.Dense(self.config.d_model * 3)
         self.out_proj = nn.Dense(self.config.d_model)
 
-    def __call__(self, x, padding_mask=None):
-        seq_len, _ = x.shape
+    def __call__(
+        self, x, cache: Optional[FlaxGPTKeyValueCacheEntry] = None, padding_mask=None
+    ):
+        seq_len = x.shape[-2]
         qkv = self.qkv_proj(x)
         q_init, k_init, v_init = jnp.array_split(
             qkv,
@@ -90,19 +39,27 @@ class FlaxGPTInnerAttention(nn.Module):
         )
         q = rearrange(
             q_init,
-            "seq (n_heads d_head) -> n_heads seq d_head",
+            "... seq (n_heads d_head) -> ... n_heads seq d_head",
             n_heads=self.config.n_heads,
         )
         k = rearrange(
             k_init,
-            "seq (n_heads d_head) -> n_heads seq d_head",
+            "... seq (n_heads d_head) -> ... n_heads seq d_head",
             n_heads=self.config.n_heads,
         )
         v = rearrange(
             v_init,
-            "seq (n_heads d_head) -> n_heads seq d_head",
+            "... seq (n_heads d_head) -> ... n_heads seq d_head",
             n_heads=self.config.n_heads,
         )
+        if cache is not None:
+            past_seq_len = cache.keys.shape[-2]
+            if past_seq_len != 0:
+                assert seq_len == 1
+
+            k, v = cache.update_and_return_keys_and_values(k, v)
+        else:
+            past_seq_len = 0
         attn = jax.vmap(lambda q, k: jnp.einsum("... q h, ... k h-> ... q k", q, k,),)(
             q,
             k,
@@ -113,7 +70,8 @@ class FlaxGPTInnerAttention(nn.Module):
             masked_attn = attn + padding_mask
         else:
             masked_attn = jnp.where(
-                jnp.arange(seq_len)[:, None] >= jnp.arange(seq_len)[None, :],
+                jnp.arange(past_seq_len, past_seq_len + seq_len)[:, None]
+                >= jnp.arange(past_seq_len + seq_len)[None, :],
                 attn,
                 float("-inf"),
             )
@@ -128,30 +86,10 @@ class FlaxGPTInnerAttention(nn.Module):
         )(softmaxed_attn, v)
         combined_values_rearranged = rearrange(
             combined_values,
-            "n_heads seq d_head -> seq (n_heads d_head)",
+            "... n_heads seq d_head -> ... seq (n_heads d_head)",
         )
         out = self.out_proj(combined_values_rearranged)
         return out
-
-
-class FlaxGPTAttention(nn.Module):
-    """Batched attention layer for GPT-style transformer models.
-
-    Args:
-        config: GPTConfig object containing the model configuration
-    """
-
-    config: FlaxGPTConfig
-
-    @nn.compact
-    def __call__(self, x, padding_mask=None):
-        return nn.vmap(
-            FlaxGPTInnerAttention,
-            in_axes=0,
-            out_axes=0,
-            variable_axes=dict(params=None),
-            split_rngs=dict(params=False),
-        )(self.config)(x, padding_mask)
 
 
 if MAIN:
@@ -159,10 +97,17 @@ if MAIN:
     x = random.normal(key1, (2, 5, 8))
     config = FlaxGPTConfig(8, 2, 2, 10, 10)
     attn_module = FlaxGPTAttention(config)
+    cache_entry = FlaxGPTKeyValueCacheEntry(
+        keys=jnp.empty((2, 2, 0, 4)),
+        values=jnp.empty((2, 2, 0, 4)),
+    )
     attn_module_params = attn_module.init(key2, x)
     jit_attn_module_apply = jax.jit(attn_module.apply)
-    out = jit_attn_module_apply(attn_module_params, x)
+    out = attn_module.apply(attn_module_params, x, cache_entry)
     assert out.shape == x.shape
+    x_n = random.normal(key1, (2, 1, 8))
+    out_n = attn_module.apply(attn_module_params, x_n, cache_entry)
+    assert out_n.shape == x_n.shape
     bidirectional_config = FlaxGPTConfig(8, 2, 2, 10, 10, bidirectional=True)
     bidirectional_attn_module = FlaxGPTAttention(bidirectional_config)
     padding_mask = rearrange(
@@ -177,12 +122,14 @@ if MAIN:
     bidirectional_attn_module_params = bidirectional_attn_module.init(
         key2,
         x,
+        None,
         padding_mask,
     )
     jit_bidirectional_attn_module_apply = jax.jit(bidirectional_attn_module.apply)
     out = jit_bidirectional_attn_module_apply(
         bidirectional_attn_module_params,
         x,
+        None,
         padding_mask,
     )
     assert out.shape == x.shape
@@ -236,9 +183,11 @@ class ResidualAndLayerNormConnection(nn.Module):
     def setup(self):
         self.norm = nn.LayerNorm(self.config.layer_norm_eps)
 
-    def __call__(self, x, padding_mask=None):
+    def __call__(
+        self, x, cache: Optional[FlaxGPTKeyValueCacheEntry] = None, padding_mask=None
+    ):
         if isinstance(self.inner_module, FlaxGPTAttention):
-            return x + self.inner_module(self.norm(x), padding_mask)
+            return x + self.inner_module(self.norm(x), cache, padding_mask)
         return x + self.inner_module(self.norm(x))
 
 
@@ -250,14 +199,21 @@ if MAIN:
     mlp_module = FlaxGPTMLP(config)
     attn_norm_module = ResidualAndLayerNormConnection(config, attn_module)
     mlp_norm_module = ResidualAndLayerNormConnection(config, mlp_module)
+    cache_entry = FlaxGPTKeyValueCacheEntry(
+        keys=jnp.empty((2, 2, 0, 8)),
+        values=jnp.empty((2, 2, 0, 8)),
+    )
     attn_norm_module_params = attn_norm_module.init(key2, x)
     mlp_norm_module_params = mlp_norm_module.init(key2, x)
-    jit_attn_norm_module_apply = jax.jit(attn_norm_module.apply)
+    # attn_norm_module.apply = jax.jit(attn_norm_module.apply)
     jit_mlp_norm_module_apply = jax.jit(mlp_norm_module.apply)
-    out_attn = jit_attn_norm_module_apply(attn_norm_module_params, x)
+    out_attn = attn_norm_module.apply(attn_norm_module_params, x, cache_entry)
     out_mlp = jit_mlp_norm_module_apply(mlp_norm_module_params, x)
     assert out_attn.shape == x.shape
     assert out_mlp.shape == x.shape
+    x_n = random.normal(key1, (2, 1, 16))
+    out_attn_n = attn_norm_module.apply(attn_norm_module_params, x_n, cache_entry)
+    assert out_attn_n.shape == x_n.shape
     bidirectional_config = FlaxGPTConfig(16, 2, 2, 10, 10, bidirectional=True)
     bidirectional_attn_module = FlaxGPTAttention(bidirectional_config)
     bidirectional_attn_norm_module = ResidualAndLayerNormConnection(
@@ -276,6 +232,7 @@ if MAIN:
     bidirectional_attn_norm_module_params = bidirectional_attn_norm_module.init(
         key2,
         x,
+        None,
         padding_mask,
     )
     jit_bidirectional_attn_norm_module_apply = jax.jit(
@@ -284,6 +241,7 @@ if MAIN:
     out = jit_bidirectional_attn_norm_module_apply(
         bidirectional_attn_norm_module_params,
         x,
+        None,
         padding_mask,
     )
     assert out.shape == x.shape
@@ -562,221 +520,219 @@ if MAIN:
             gpt=dict(
                 tok_embed=dict(),
                 pos_embed=dict(),
-                blocks=dict(
-                    layers_0=dict(
-                        attn=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                VmapFlaxGPTInnerAttention_0=dict(
-                                    out_proj=dict(),
-                                    qkv_proj=dict(),
-                                ),
-                            ),
-                        ),
-                        mlp=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                ff_1=dict(),
-                                ff_2=dict(),
+                blocks_0=dict(
+                    attn=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            VmapFlaxGPTInnerAttention_0=dict(
+                                out_proj=dict(),
+                                qkv_proj=dict(),
                             ),
                         ),
                     ),
-                    layers_1=dict(
-                        attn=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                VmapFlaxGPTInnerAttention_0=dict(
-                                    out_proj=dict(),
-                                    qkv_proj=dict(),
-                                ),
-                            ),
+                    mlp=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            ff_1=dict(),
+                            ff_2=dict(),
                         ),
-                        mlp=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                ff_1=dict(),
-                                ff_2=dict(),
+                    ),
+                ),
+                blocks_1=dict(
+                    attn=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            VmapFlaxGPTInnerAttention_0=dict(
+                                out_proj=dict(),
+                                qkv_proj=dict(),
                             ),
                         ),
                     ),
-                    layers_2=dict(
-                        attn=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                VmapFlaxGPTInnerAttention_0=dict(
-                                    out_proj=dict(),
-                                    qkv_proj=dict(),
-                                ),
-                            ),
+                    mlp=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            ff_1=dict(),
+                            ff_2=dict(),
                         ),
-                        mlp=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                ff_1=dict(),
-                                ff_2=dict(),
+                    ),
+                ),
+                blocks_2=dict(
+                    attn=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            VmapFlaxGPTInnerAttention_0=dict(
+                                out_proj=dict(),
+                                qkv_proj=dict(),
                             ),
                         ),
                     ),
-                    layers_3=dict(
-                        attn=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                VmapFlaxGPTInnerAttention_0=dict(
-                                    out_proj=dict(),
-                                    qkv_proj=dict(),
-                                ),
-                            ),
+                    mlp=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            ff_1=dict(),
+                            ff_2=dict(),
                         ),
-                        mlp=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                ff_1=dict(),
-                                ff_2=dict(),
+                    ),
+                ),
+                blocks_3=dict(
+                    attn=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            VmapFlaxGPTInnerAttention_0=dict(
+                                out_proj=dict(),
+                                qkv_proj=dict(),
                             ),
                         ),
                     ),
-                    layers_4=dict(
-                        attn=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                VmapFlaxGPTInnerAttention_0=dict(
-                                    out_proj=dict(),
-                                    qkv_proj=dict(),
-                                ),
-                            ),
+                    mlp=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            ff_1=dict(),
+                            ff_2=dict(),
                         ),
-                        mlp=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                ff_1=dict(),
-                                ff_2=dict(),
+                    ),
+                ),
+                blocks_4=dict(
+                    attn=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            VmapFlaxGPTInnerAttention_0=dict(
+                                out_proj=dict(),
+                                qkv_proj=dict(),
                             ),
                         ),
                     ),
-                    layers_5=dict(
-                        attn=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                VmapFlaxGPTInnerAttention_0=dict(
-                                    out_proj=dict(),
-                                    qkv_proj=dict(),
-                                ),
-                            ),
+                    mlp=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            ff_1=dict(),
+                            ff_2=dict(),
                         ),
-                        mlp=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                ff_1=dict(),
-                                ff_2=dict(),
+                    ),
+                ),
+                blocks_5=dict(
+                    attn=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            VmapFlaxGPTInnerAttention_0=dict(
+                                out_proj=dict(),
+                                qkv_proj=dict(),
                             ),
                         ),
                     ),
-                    layers_6=dict(
-                        attn=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                VmapFlaxGPTInnerAttention_0=dict(
-                                    out_proj=dict(),
-                                    qkv_proj=dict(),
-                                ),
-                            ),
+                    mlp=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            ff_1=dict(),
+                            ff_2=dict(),
                         ),
-                        mlp=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                ff_1=dict(),
-                                ff_2=dict(),
+                    ),
+                ),
+                blocks_6=dict(
+                    attn=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            VmapFlaxGPTInnerAttention_0=dict(
+                                out_proj=dict(),
+                                qkv_proj=dict(),
                             ),
                         ),
                     ),
-                    layers_7=dict(
-                        attn=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                VmapFlaxGPTInnerAttention_0=dict(
-                                    out_proj=dict(),
-                                    qkv_proj=dict(),
-                                ),
-                            ),
+                    mlp=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            ff_1=dict(),
+                            ff_2=dict(),
                         ),
-                        mlp=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                ff_1=dict(),
-                                ff_2=dict(),
+                    ),
+                ),
+                blocks_7=dict(
+                    attn=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            VmapFlaxGPTInnerAttention_0=dict(
+                                out_proj=dict(),
+                                qkv_proj=dict(),
                             ),
                         ),
                     ),
-                    layers_8=dict(
-                        attn=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                VmapFlaxGPTInnerAttention_0=dict(
-                                    out_proj=dict(),
-                                    qkv_proj=dict(),
-                                ),
-                            ),
+                    mlp=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            ff_1=dict(),
+                            ff_2=dict(),
                         ),
-                        mlp=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                ff_1=dict(),
-                                ff_2=dict(),
+                    ),
+                ),
+                blocks_8=dict(
+                    attn=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            VmapFlaxGPTInnerAttention_0=dict(
+                                out_proj=dict(),
+                                qkv_proj=dict(),
                             ),
                         ),
                     ),
-                    layers_9=dict(
-                        attn=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                VmapFlaxGPTInnerAttention_0=dict(
-                                    out_proj=dict(),
-                                    qkv_proj=dict(),
-                                ),
-                            ),
+                    mlp=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            ff_1=dict(),
+                            ff_2=dict(),
                         ),
-                        mlp=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                ff_1=dict(),
-                                ff_2=dict(),
+                    ),
+                ),
+                blocks_9=dict(
+                    attn=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            VmapFlaxGPTInnerAttention_0=dict(
+                                out_proj=dict(),
+                                qkv_proj=dict(),
                             ),
                         ),
                     ),
-                    layers_10=dict(
-                        attn=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                VmapFlaxGPTInnerAttention_0=dict(
-                                    out_proj=dict(),
-                                    qkv_proj=dict(),
-                                ),
-                            ),
+                    mlp=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            ff_1=dict(),
+                            ff_2=dict(),
                         ),
-                        mlp=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                ff_1=dict(),
-                                ff_2=dict(),
+                    ),
+                ),
+                blocks_10=dict(
+                    attn=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            VmapFlaxGPTInnerAttention_0=dict(
+                                out_proj=dict(),
+                                qkv_proj=dict(),
                             ),
                         ),
                     ),
-                    layers_11=dict(
-                        attn=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                VmapFlaxGPTInnerAttention_0=dict(
-                                    out_proj=dict(),
-                                    qkv_proj=dict(),
-                                ),
+                    mlp=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            ff_1=dict(),
+                            ff_2=dict(),
+                        ),
+                    ),
+                ),
+                blocks_11=dict(
+                    attn=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            VmapFlaxGPTInnerAttention_0=dict(
+                                out_proj=dict(),
+                                qkv_proj=dict(),
                             ),
                         ),
-                        mlp=dict(
-                            norm=dict(),
-                            inner_module=dict(
-                                ff_1=dict(),
-                                ff_2=dict(),
-                            ),
+                    ),
+                    mlp=dict(
+                        norm=dict(),
+                        inner_module=dict(
+                            ff_1=dict(),
+                            ff_2=dict(),
                         ),
                     ),
                 ),
@@ -789,99 +745,111 @@ if MAIN:
         if param_name == "transformer.wte.weight":
             new_flax_gpt2_small_params["params"]["gpt"]["tok_embed"][
                 "embedding"
-            ] = jnp.array(param.cpu().numpy())
+            ] = jnp.array(
+                param.cpu().numpy(),
+            )
         if param_name == "transformer.wpe.weight":
             new_flax_gpt2_small_params["params"]["gpt"]["pos_embed"][
                 "embedding"
-            ] = jnp.array(param.cpu().numpy())
+            ] = jnp.array(
+                param.cpu().numpy(),
+            )
         if param_name.split(".")[1] == "h":
             block_num = int(param_name.split(".")[2])
             if "ln_1.weight" in param_name:
-                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][
-                    f"layers_{block_num}"
-                ]["attn"]["norm"]["scale"] = jnp.array(param.cpu().numpy())
+                new_flax_gpt2_small_params["params"]["gpt"][f"blocks_{block_num}"][
+                    "attn"
+                ]["norm"]["scale"] = jnp.array(
+                    param.cpu().numpy(),
+                )
             if "ln_1.bias" in param_name:
-                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][
-                    f"layers_{block_num}"
-                ]["attn"]["norm"]["bias"] = jnp.array(param.cpu().numpy())
+                new_flax_gpt2_small_params["params"]["gpt"][f"blocks_{block_num}"][
+                    "attn"
+                ]["norm"]["bias"] = jnp.array(
+                    param.cpu().numpy(),
+                )
             if "attn.c_attn.weight" in param_name:
-                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][
-                    f"layers_{block_num}"
-                ]["attn"]["inner_module"]["VmapFlaxGPTInnerAttention_0"]["qkv_proj"][
+                new_flax_gpt2_small_params["params"]["gpt"][f"blocks_{block_num}"][
+                    "attn"
+                ]["inner_module"]["VmapFlaxGPTInnerAttention_0"]["qkv_proj"][
                     "kernel"
                 ] = jnp.array(
-                    param.cpu().numpy()
+                    param.cpu().numpy(),
                 )
             if "attn.c_attn.bias" in param_name:
-                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][
-                    f"layers_{block_num}"
-                ]["attn"]["inner_module"]["VmapFlaxGPTInnerAttention_0"]["qkv_proj"][
+                new_flax_gpt2_small_params["params"]["gpt"][f"blocks_{block_num}"][
+                    "attn"
+                ]["inner_module"]["VmapFlaxGPTInnerAttention_0"]["qkv_proj"][
                     "bias"
                 ] = jnp.array(
                     param.cpu().numpy()
                 )
             if "attn.c_proj.weight" in param_name:
-                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][
-                    f"layers_{block_num}"
-                ]["attn"]["inner_module"]["VmapFlaxGPTInnerAttention_0"]["out_proj"][
+                new_flax_gpt2_small_params["params"]["gpt"][f"blocks_{block_num}"][
+                    "attn"
+                ]["inner_module"]["VmapFlaxGPTInnerAttention_0"]["out_proj"][
                     "kernel"
                 ] = jnp.array(
-                    param.cpu().numpy()
+                    param.cpu().numpy(),
                 )
             if "attn.c_proj.bias" in param_name:
-                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][
-                    f"layers_{block_num}"
-                ]["attn"]["inner_module"]["VmapFlaxGPTInnerAttention_0"]["out_proj"][
+                new_flax_gpt2_small_params["params"]["gpt"][f"blocks_{block_num}"][
+                    "attn"
+                ]["inner_module"]["VmapFlaxGPTInnerAttention_0"]["out_proj"][
                     "bias"
                 ] = jnp.array(
-                    param.cpu().numpy()
+                    param.cpu().numpy(),
                 )
             if "ln_2.weight" in param_name:
-                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][
-                    f"layers_{block_num}"
-                ]["mlp"]["norm"]["scale"] = jnp.array(param.cpu().numpy())
+                new_flax_gpt2_small_params["params"]["gpt"][f"blocks_{block_num}"][
+                    "mlp"
+                ]["norm"]["scale"] = jnp.array(
+                    param.cpu().numpy(),
+                )
             if "ln_2.bias" in param_name:
-                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][
-                    f"layers_{block_num}"
-                ]["mlp"]["norm"]["bias"] = jnp.array(param.cpu().numpy())
+                new_flax_gpt2_small_params["params"]["gpt"][f"blocks_{block_num}"][
+                    "mlp"
+                ]["norm"]["bias"] = jnp.array(
+                    param.cpu().numpy(),
+                )
             if "mlp.c_fc.weight" in param_name:
-                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][
-                    f"layers_{block_num}"
-                ]["mlp"]["inner_module"]["ff_1"]["kernel"] = jnp.array(
-                    param.cpu().numpy()
+                new_flax_gpt2_small_params["params"]["gpt"][f"blocks_{block_num}"][
+                    "mlp"
+                ]["inner_module"]["ff_1"]["kernel"] = jnp.array(
+                    param.cpu().numpy(),
                 )
             if "mlp.c_fc.bias" in param_name:
-                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][
-                    f"layers_{block_num}"
-                ]["mlp"]["inner_module"]["ff_1"]["bias"] = jnp.array(
-                    param.cpu().numpy()
+                new_flax_gpt2_small_params["params"]["gpt"][f"blocks_{block_num}"][
+                    "mlp"
+                ]["inner_module"]["ff_1"]["bias"] = jnp.array(
+                    param.cpu().numpy(),
                 )
             if "mlp.c_proj.weight" in param_name:
-                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][
-                    f"layers_{block_num}"
-                ]["mlp"]["inner_module"]["ff_2"]["kernel"] = jnp.array(
-                    param.cpu().numpy()
+                new_flax_gpt2_small_params["params"]["gpt"][f"blocks_{block_num}"][
+                    "mlp"
+                ]["inner_module"]["ff_2"]["kernel"] = jnp.array(
+                    param.cpu().numpy(),
                 )
             if "mlp.c_proj.bias" in param_name:
-                new_flax_gpt2_small_params["params"]["gpt"]["blocks"][
-                    f"layers_{block_num}"
-                ]["mlp"]["inner_module"]["ff_2"]["bias"] = jnp.array(
-                    param.cpu().numpy()
+                new_flax_gpt2_small_params["params"]["gpt"][f"blocks_{block_num}"][
+                    "mlp"
+                ]["inner_module"]["ff_2"]["bias"] = jnp.array(
+                    param.cpu().numpy(),
                 )
         if "ln_f.weight" in param_name:
             new_flax_gpt2_small_params["params"]["ln_final"]["scale"] = jnp.array(
-                param.cpu().numpy()
+                param.cpu().numpy(),
             )
         if "ln_f.bias" in param_name:
             new_flax_gpt2_small_params["params"]["ln_final"]["bias"] = jnp.array(
-                param.cpu().numpy()
+                param.cpu().numpy(),
             )
         if "lm_head.weight" in param_name:
             new_flax_gpt2_small_params["params"]["lm_head"]["kernel"] = jnp.array(
-                param.cpu().numpy()
+                param.cpu().numpy(),
             ).T
     new_flax_gpt2_small_params["params"]["lm_head"]["bias"] = jnp.zeros_like(
-        flax_gpt2_small_params["params"]["lm_head"]["bias"]
+        flax_gpt2_small_params["params"]["lm_head"]["bias"],
     )
     frozen_params = to_frozen(new_flax_gpt2_small_params)
     jax_outputs = jit_flax_gpt2_small_apply(
