@@ -28,6 +28,7 @@ class FlaxGPTConfig:
             to 4 * d_model
         activation: Activation function to use in the transformer block. Defaults
             to "gelu" - only relu and gelu are currently supported.
+        bidirectional: If True, use a bidirectional transformer block
 
     """
 
@@ -41,6 +42,7 @@ class FlaxGPTConfig:
     attn_only: bool = False
     mlp_dim: Optional[int] = None
     activation: Optional[str] = None
+    bidirectional: bool = False
 
     def __post_init__(self):
         self.d_head = self.d_model // self.n_heads
@@ -74,7 +76,7 @@ class FlaxGPTInnerAttention(nn.Module):
         self.qkv_proj = nn.Dense(self.config.d_model * 3)
         self.out_proj = nn.Dense(self.config.d_model)
 
-    def __call__(self, x):
+    def __call__(self, x, padding_mask=None):
         seq_len, _ = x.shape
         qkv = self.qkv_proj(x)
         q_init, k_init, v_init = jnp.array_split(
@@ -101,11 +103,16 @@ class FlaxGPTInnerAttention(nn.Module):
             q,
             k,
         ) / jnp.sqrt(self.config.d_head)
-        masked_attn = jnp.where(
-            jnp.arange(seq_len)[:, None] >= jnp.arange(seq_len)[None, :],
-            attn,
-            float("-inf"),
-        )
+        if self.config.bidirectional:
+            assert padding_mask is not None
+            padding_mask = jnp.where(padding_mask, 0, float("-inf"))
+            masked_attn = attn + padding_mask
+        else:
+            masked_attn = jnp.where(
+                jnp.arange(seq_len)[:, None] >= jnp.arange(seq_len)[None, :],
+                attn,
+                float("-inf"),
+            )
         softmaxed_attn = nn.softmax(masked_attn, -1)
         combined_values = jax.vmap(
             lambda attn, v: jnp.einsum(
@@ -133,14 +140,14 @@ class FlaxGPTAttention(nn.Module):
     config: FlaxGPTConfig
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, padding_mask=None):
         return nn.vmap(
             FlaxGPTInnerAttention,
             in_axes=0,
             out_axes=0,
             variable_axes=dict(params=None),
             split_rngs=dict(params=False),
-        )(self.config)(x)
+        )(self.config)(x, padding_mask)
 
 
 if MAIN:
@@ -152,6 +159,30 @@ if MAIN:
     jit_attn_module_apply = jax.jit(attn_module.apply)
     out = jit_attn_module_apply(attn_module_params, x)
     assert out.shape == x.shape
+    bidirectional_config = FlaxGPTConfig(8, 2, 2, 10, 10, bidirectional=True)
+    bidirectional_attn_module = FlaxGPTAttention(bidirectional_config)
+    padding_mask = rearrange(
+        jnp.array(
+            [
+                [True, True, True, False, False],
+                [True, True, False, False, False],
+            ],
+        ),
+        "batch seq -> batch 1 seq 1",
+    )
+    bidirectional_attn_module_params = bidirectional_attn_module.init(
+        key2,
+        x,
+        padding_mask,
+    )
+    jit_bidirectional_attn_module_apply = jax.jit(bidirectional_attn_module.apply)
+    out = jit_bidirectional_attn_module_apply(
+        bidirectional_attn_module_params,
+        x,
+        padding_mask,
+    )
+    assert out.shape == x.shape
+
 # %%
 class FlaxGPTMLP(nn.Module):
     """MLP layer for GPT-style transformer models.
@@ -201,7 +232,9 @@ class ResidualAndLayerNormConnection(nn.Module):
     def setup(self):
         self.norm = nn.LayerNorm(self.config.layer_norm_eps)
 
-    def __call__(self, x):
+    def __call__(self, x, padding_mask=None):
+        if isinstance(self.inner_module, FlaxGPTAttention):
+            return x + self.inner_module(self.norm(x), padding_mask)
         return x + self.inner_module(self.norm(x))
 
 
@@ -221,6 +254,35 @@ if MAIN:
     out_mlp = jit_mlp_norm_module_apply(mlp_norm_module_params, x)
     assert out_attn.shape == x.shape
     assert out_mlp.shape == x.shape
+    bidirectional_config = FlaxGPTConfig(16, 2, 2, 10, 10, bidirectional=True)
+    bidirectional_attn_module = FlaxGPTAttention(bidirectional_config)
+    bidirectional_attn_norm_module = ResidualAndLayerNormConnection(
+        bidirectional_config,
+        bidirectional_attn_module,
+    )
+    padding_mask = rearrange(
+        jnp.array(
+            [
+                [True, True, True, False, False],
+                [True, True, False, False, False],
+            ],
+        ),
+        "batch seq -> batch 1 seq 1",
+    )
+    bidirectional_attn_norm_module_params = bidirectional_attn_norm_module.init(
+        key2,
+        x,
+        padding_mask,
+    )
+    jit_bidirectional_attn_norm_module_apply = jax.jit(
+        bidirectional_attn_norm_module.apply,
+    )
+    out = jit_bidirectional_attn_norm_module_apply(
+        bidirectional_attn_norm_module_params,
+        x,
+        padding_mask,
+    )
+    assert out.shape == x.shape
 # %%
 class FlaxGPTBlock(nn.Module):
     """GPT-style transformer block.
@@ -242,8 +304,8 @@ class FlaxGPTBlock(nn.Module):
                 FlaxGPTMLP(self.config),
             )
 
-    def __call__(self, x):
-        post_attn = self.attn(x)
+    def __call__(self, x, padding_mask=None):
+        post_attn = self.attn(x, padding_mask)
         if self.config.attn_only:
             return post_attn
         return self.mlp(post_attn)
@@ -258,6 +320,32 @@ if MAIN:
     jit_block_module_apply = jax.jit(block_module.apply)
     out = jit_block_module_apply(block_module_params, x)
     assert out.shape == x.shape
+    bidirectional_config = FlaxGPTConfig(32, 2, 2, 10, 10, bidirectional=True)
+    bidirectional_block_module = FlaxGPTBlock(bidirectional_config)
+    padding_mask = rearrange(
+        jnp.array(
+            [
+                [True, True, True, False, False],
+                [True, True, False, False, False],
+            ],
+        ),
+        "batch seq -> batch 1 seq 1",
+    )
+    bidirectional_block_module_params = bidirectional_block_module.init(
+        key2,
+        x,
+        padding_mask,
+    )
+    jit_bidirectional_block_module_apply = jax.jit(
+        bidirectional_block_module.apply,
+    )
+    out = jit_bidirectional_block_module_apply(
+        bidirectional_block_module_params,
+        x,
+        padding_mask,
+    )
+    assert out.shape == x.shape
+
 # %%
 class FlaxGPT(nn.Module):
     """GPT-style transformer model.
@@ -271,15 +359,14 @@ class FlaxGPT(nn.Module):
     def setup(self):
         self.tok_embed = nn.Embed(self.config.d_vocab, self.config.d_model)
         self.pos_embed = nn.Embed(self.config.n_ctx, self.config.d_model)
-        self.blocks = nn.Sequential(
-            [FlaxGPTBlock(self.config) for _ in range(self.config.n_layers)],
-        )
+        self.blocks = [FlaxGPTBlock(self.config) for _ in range(self.config.n_layers)]
 
-    def __call__(self, x):
+    def __call__(self, x, padding_mask=None):
         _, seq = x.shape
-        embed = self.tok_embed(x) + self.pos_embed(jnp.arange(seq))
-        post_blocks = self.blocks(embed)
-        return post_blocks
+        x = self.tok_embed(x) + self.pos_embed(jnp.arange(seq))
+        for block in self.blocks:
+            x = block(x, padding_mask)
+        return x
 
 
 if MAIN:
@@ -291,6 +378,39 @@ if MAIN:
     jit_gpt_module_apply = jax.jit(gpt_module.apply)
     out = jit_gpt_module_apply(gpt_module_params, x)
     assert out.shape == x.shape + (config.d_model,)
+    bidirectional_config = FlaxGPTConfig(
+        24,
+        2,
+        2,
+        10,
+        10,
+        12,
+        bidirectional=True,
+    )
+    bidirectional_gpt_module = FlaxGPT(bidirectional_config)
+    padding_mask = rearrange(
+        jnp.array(
+            [
+                [True, True, True, False, False],
+                [True, True, False, False, False],
+            ],
+        ),
+        "batch seq -> batch 1 seq 1",
+    )
+    bidirectional_gpt_module_params = bidirectional_gpt_module.init(
+        key2,
+        x,
+        padding_mask,
+    )
+    jit_bidirectional_gpt_module_apply = jax.jit(
+        bidirectional_gpt_module.apply,
+    )
+    out = jit_bidirectional_gpt_module_apply(
+        bidirectional_gpt_module_params,
+        x,
+        padding_mask,
+    )
+    assert out.shape == x.shape + (bidirectional_config.d_model,)
 
 # %%
 class FlaxGPTLM(nn.Module):
@@ -301,6 +421,12 @@ class FlaxGPTLM(nn.Module):
     """
 
     config: FlaxGPTConfig
+
+    def __post__init__(self):
+        assert (
+            self.config.bidirectional is False
+        ), "bidirectional not allowed for language modeling"
+        super().__post__init__()
 
     def setup(self):
         self.gpt = FlaxGPT(self.config)
@@ -322,6 +448,43 @@ if MAIN:
     jit_gpt_lm_module_apply = jax.jit(gpt_lm_module.apply)
     out = jit_gpt_lm_module_apply(gpt_lm_module_params, x)
     assert out.shape == x.shape + (config.d_vocab_out,)
+    bidirectional_config = FlaxGPTConfig(
+        16,
+        2,
+        2,
+        10,
+        10,
+        bidirectional=True,
+    )
+    try:
+        bidirectional_gpt_lm_module = FlaxGPTLM(bidirectional_config)
+    except AssertionError:
+        pass
+# %%
+class FlaxGPTClasifier(nn.Module):
+    """GPT-style transformer classifier.
+
+    Args:
+        config: GPTConfig object containing the model configuration
+    """
+
+    config: FlaxGPTConfig
+
+    def __post__init__(self):
+        assert self.config.bidirectional, "bidirectional requires for classification"
+        super().__post__init__()
+
+    def setup(self):
+        self.gpt = FlaxGPT(self.config)
+        self.ln_final = nn.LayerNorm(self.config.layer_norm_eps)
+        self.classifier_head = nn.Dense(self.config.n_classes)
+
+    def __call__(self, x):
+        post_base = self.gpt(x)
+        post_final_ln = self.ln_final(post_base)
+        return self.classifier(post_final_ln)
+
+
 # %%
 # Test same output as Tranformers Model
 if MAIN:
